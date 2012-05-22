@@ -1,0 +1,512 @@
+#!/usr/bin/env node
+
+var http = require("http");
+var spawn = require('child_process').spawn
+var exec = require('child_process').exec
+
+var term = {
+    buffer: "",
+    colorStack: [],
+    currentColor: "\x1b[0m",
+
+    color: function (color) {
+        if (!color) {
+            color = this.colorStack.pop();
+            this.currentColor = color;
+        } else {
+            this.colorStack.push(this.currentColor);
+            this.currentColor = color;
+        }
+        this.buffer += color || "\x1b[0m";
+    },
+
+    flush: function () {
+        process.stdout.write("\033\143" + this.buffer);
+        this.buffer = "";
+    },
+
+    write: function (str) {
+        //console.log(str);
+        this.buffer += str;
+    },
+    newline: function () {
+        this.buffer += "\n";
+    }
+
+}
+
+function pad(str, len, ellipsis, left) {
+    str = "" + str || "";
+    var oriLen = str.length;
+
+    if (oriLen > len) {
+        if (ellipsis) {
+            len -= ellipsis.length;
+        }
+        return str.substr(0, len) + (ellipsis || "")
+    } else {
+
+        var delta = len - oriLen;
+        var padding = "";
+        while (delta) {
+            if (delta > 10) {
+                padding += "          ";
+                delta -= 10;
+            } else if (delta > 5) {
+                padding += "     ";
+                delta -= 5;
+            } else {
+                padding += " ";
+                delta -= 1;
+            }
+        }
+
+        if (left) {
+            str = padding + str;
+        } else {
+            str = str + padding;
+        }
+
+        return str;
+
+    }
+
+}
+
+(function () {
+    var tout;
+    process.on('SIGWINCH', function () {
+        if (!tout) {
+            tout = setTimeout(function () {
+                terminalSize();
+                tout = null;
+            }, 1);
+        }
+    });
+})();
+
+
+
+function getTermSize(cb) {
+    spawn('resize').stdout.on('data', function (data) {
+        data = String(data)
+        var lines = data.split('\n'),
+            cols = Number(lines[0].match(/^COLUMNS=([0-9]+);$/)[1]),
+            lines = Number(lines[1].match(/^LINES=([0-9]+);$/)[1])
+            if (cb) cb(cols, lines)
+    })
+}
+
+function terminalSize() {
+
+    getTermSize(function (cols, rows) {
+        termWidth = cols;
+
+        limit = rows - 3;
+        showPosts(currentPosts);
+        //console.log(cols);
+    });
+
+}
+terminalSize();
+//console.dir(process.env)
+
+var currentPosts;
+var currentPostIdx = 0;
+var cookie;
+var subreddit = "/";
+var loadSetTimeout = 0;
+var modhash;
+var limit = 25;
+var termWidth = 80;
+var refreshTimeout = 0;
+
+if (process.argv[2]) {
+    login(process.argv[2], process.argv[3]);
+} else {
+    load();
+}
+
+var ops = {}
+
+ops["\u001b\u005b\u0042"] = function down() {
+    currentPostIdx++;
+    showPosts(currentPosts);
+}
+
+ops["\u0009"] = function tab() {
+    var post = currentPosts[currentPostIdx];
+    subreddit = "/r/" + post.data.subreddit + "/";
+    load();
+};
+
+ops["\u0060"] = function backtick() {
+    subreddit = "/r/all/";
+    load();
+};
+
+ops["\u001b"] = function esc() {
+    //var post = currentPosts[currentPostIdx];
+    subreddit = "/";
+    load();
+};
+
+ops["\u003d"] = function voteUp() {
+    var post = currentPosts[currentPostIdx];
+    vote(post, 1);
+    showPosts(currentPosts);
+};
+
+ops["\u0003"] = function voteUp() {
+    console.log("\n    ಠ_ಠ\n");
+    process.exit();
+};
+ops["\u002d"] = function voteDown() {
+    var post = currentPosts[currentPostIdx];
+    vote(post, -1);
+    showPosts(currentPosts);
+};
+ops["\u007f"] = function del() {
+    var post = currentPosts[currentPostIdx];
+    hide(post);
+    showPosts(currentPosts);
+};
+
+ops["\u001b\u005b\u0041"] = function up() {
+    currentPostIdx--;
+    showPosts(currentPosts);
+}
+ops["\u001b\u005b\u0044"] = function left() {
+
+}
+ops["\u001b\u005b\u0043"] = function right() {
+
+}
+ops["\u000d"] = function enter() {
+    var post = currentPosts[currentPostIdx];
+    //console.log(post)
+    exec('open ' + post.data.url)
+}
+
+ops["\u0020"] = function spacebar() {
+    var post = currentPosts[currentPostIdx];
+    //console.log(post)
+    exec('open http://reddit.com' + post.data.permalink)
+}
+
+var sort = false;
+ops["\u002f"] = function forwardSlash() {
+    sort = !sort;
+    showPosts(currentPosts);
+}
+
+
+
+
+
+process.stdin.setEncoding('utf8');
+process.stdin.resume();
+process.stdin.setRawMode(true);
+process.stdin.on('data', function (chunk, key) {
+    //process.stdout.write("\\"+chunk);
+    if (ops[chunk]) {
+        ops[chunk]();
+        return;
+    }
+});
+
+
+
+
+function login(user, password) {
+
+    var post_data = "user=" + user + "&passwd=" + password;
+
+    var options = {
+        host: 'www.reddit.com',
+        port: 80,
+        path: '/api/login',
+        method: "POST",
+        headers: {
+            'User-agent': 'https://github.com/abustin/reddit-term',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': post_data.length
+        }
+    };
+
+
+
+    var req = http.request(options, function (res) {
+        //console.log('STATUS: ' + res.statusCode);
+        //console.log(res.headers['set-cookie']);
+        //var cookie;
+        if (res.headers['set-cookie']) {
+            cookie = res.headers['set-cookie'].map(function (data) {
+                return data.substr(0, data.indexOf(";"));
+            }).join("; ")
+        }
+
+        var body = "";
+
+        res.setEncoding('utf8');
+        res.on('data', function (chunk) {
+            body += chunk
+        });
+        res.on('end', function (chunk) {
+            //console.log(JSON.stringify(JSON.parse(body), null, "   "));
+        });
+
+        //console.log(cookie);
+        load();
+    });
+    req.write(post_data);
+    req.end();
+
+}
+
+function vote(post, vote) {
+
+    switch (vote) {
+    case 1:
+        post.data.likes = true;
+        break;
+    case -1:
+        post.data.likes = false;
+        break;
+    default:
+        post.data.likes = null;
+        break;
+    }
+
+    var post_data = "id=" + post.data.name + "&uh=" + modhash + "&dir=" + vote;
+    //console.log(post_data);
+    var options = {
+        host: 'www.reddit.com',
+        port: 80,
+        path: '/api/vote',
+        method: "POST",
+        headers: {
+            'User-agent': 'https://github.com/abustin/reddit-term',
+            'Cookie': cookie,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': post_data.length
+        }
+    };
+
+    var req = http.request(options, function (res) {
+        //console.log('vote STATUS: ' + res.statusCode);
+        var body = "";
+        res.setEncoding('utf8');
+        res.on('data', function (chunk) {
+            body += chunk
+        });
+        res.on('end', function (chunk) {
+            //console.log(body);
+        });
+    });
+    req.write(post_data);
+    req.end();
+
+}
+
+
+function hide(post) {
+
+    post.data.hidden = true;
+    var post_data = "id=" + post.data.name + "&uh=" + modhash
+    //console.log(post_data);
+    var options = {
+        host: 'www.reddit.com',
+        port: 80,
+        path: '/api/hide',
+        method: "POST",
+        headers: {
+            'User-agent': 'https://github.com/abustin/reddit-term',
+            'Cookie': cookie,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': post_data.length
+        }
+    };
+
+    var req = http.request(options, function (res) {
+        //console.log('vote STATUS: ' + res.statusCode);
+        var body = "";
+
+        res.setEncoding('utf8');
+        res.on('data', function (chunk) {
+            body += chunk
+        });
+        res.on('end', function (chunk) {
+            //console.log(body);
+        });
+    });
+    req.write(post_data);
+    req.end();
+
+}
+
+function load() {
+
+    clearTimeout(loadSetTimeout);
+
+    var options = {
+        host: 'www.reddit.com',
+        port: 80,
+        path: subreddit + '.json?limit=' + limit,
+        headers: {
+            'User-agent': 'https://github.com/abustin/reddit-term',
+            'Cookie': cookie
+        }
+    };
+
+    //console.log(options);
+    var req = http.get(options, function (res) {
+        //console.log('STATUS: ' + res.statusCode);
+        //console.log('HEADERS: ' + JSON.stringify(res.headers));
+        var body = "";
+
+        res.setEncoding('utf8');
+        res.on('data', function (chunk) {
+            body += chunk
+        });
+        res.on('end', function (chunk) {
+            try {
+                var obj = JSON.parse(body);
+                var posts = obj.data.children;
+                modhash = obj.data.modhash;
+            } catch (e) {}
+            posts && showPosts(posts);
+        });
+    });
+
+    loadSetTimeout = setTimeout(load, 30000)
+}
+
+
+
+
+
+
+
+
+function showPosts(posts) {
+
+    clearTimeout(refreshTimeout);
+    var showingDelta = false;
+
+    //console.log("dsfsf")
+    if (!posts) {
+        return;
+    }
+    //console.log("dsfsfer")
+    posts.index = {};
+    var theposts = posts;
+    if (sort) {
+        theposts = posts.concat().sort(function (a, b) {
+            if (a.data.subreddit.toLowerCase() > b.data.subreddit.toLowerCase()) {
+                return 1;
+            } else if (a.data.subreddit.toLowerCase() < b.data.subreddit.toLowerCase()) {
+                return -1;
+            } else {
+                return b.data.score - a.data.score
+            }
+        });
+    }
+
+
+    // HEADER
+    var titleLen = Math.min(80, 80 - (116 - termWidth));
+    var skipDomain = false;
+    if (titleLen < 54) {
+        titleLen += 14
+        skipDomain = true;
+    }
+
+    term.color("\x1b[7m");
+    term.write(pad("VOTES", 6));
+    term.write(pad("SUBREDDIT", 15));
+    term.write(pad("TITLE", titleLen));
+    if (!skipDomain) {
+        term.write(pad("    DOMAIN", 12));
+    }
+    term.color();
+    term.newline();
+
+
+    var count = 0;
+
+    currentPosts = posts;
+
+    theposts.forEach(function (post, i) {
+
+        if (count + 1 > limit || post.data.hidden) {
+            return;
+        }
+
+        if (count === currentPostIdx) {
+            term.color("\x1b[33m");
+        }
+
+        post = post.data;
+        var score = post.score;
+        var diff;
+        if (currentPosts) {
+            var last = currentPosts.index[post.name];
+            if (last) {
+                if (score != last.score) {
+                    showingDelta = true;
+                    diff = parseFloat(score) - parseFloat(last.score);
+                    if (diff > 0) {
+                        score = "+" + diff
+                    } else {
+                        score = diff
+                    }
+
+                }
+            }
+        }
+
+        posts.index[post.name] = post;
+        //buffer += i;
+        term.write(pad(score, 5, null, true));
+        term.write(" ");
+        term.write(pad(post.subreddit, 10));
+
+        //buffer+="\x1b[0m";
+        term.write("   ");
+        var arrow = (post.likes === false) ? "-" : (post.likes === true) ? "+" : " ";
+
+        if (arrow) {
+            if (post.likes) {
+                term.color("\x1b[31m");
+            } else {
+                term.color("\x1b[34m");
+            }
+            term.write(arrow);
+            term.color();
+        }
+
+        term.write(" ");
+        term.write(pad(post.title.replace("\n", ""), titleLen, "..."));
+        if (!skipDomain) {
+            term.write("    ");
+            term.write(pad(post.domain, 10));
+        }
+        term.newline();
+        //console.log(post)
+        if (count === currentPostIdx) {
+            term.color();
+        }
+
+        count++;
+    });
+
+    if (showingDelta) {
+        refreshTimeout = setTimeout(function () {
+            showPosts(posts);
+        }, 15000);
+    }
+
+    term.flush();
+
+}
